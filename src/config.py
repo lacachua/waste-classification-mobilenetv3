@@ -1,4 +1,3 @@
-# src/config.py
 
 from pathlib import Path
 
@@ -22,5 +21,8 @@ CLASS_NAMES = [
     "trash",
 ]
 
-OUTPUT_DIR = Path("/kaggle/working/outputs")
+PROJECT_DIR = Path(
+    "/kaggle/working/waste-classification-mobilenetv3"
+)
+OUTPUT_DIR = PROJECT_DIR / "outputs"
 BEST_MODEL_PATH = OUTPUT_DIR / "best_model.pth"
