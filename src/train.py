@@ -1,313 +1,174 @@
-
-from pathlib import Path
 import time
 
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import f1_score
 from tqdm.auto import tqdm
 
 from src.config import (
+    BASELINE_EPOCHS,
+    BASELINE_LEARNING_RATE,
+    BASELINE_MODEL_PATH,
     CLASS_NAMES,
-    EPOCHS,
-    LEARNING_RATE,
     OUTPUT_DIR,
-    BEST_MODEL_PATH,
+    SEED,
+    WEIGHT_DECAY,
 )
 from src.dataset import create_dataloaders
 from src.model import create_model
+from src.utils import seed_everything
 
 
 def calculate_class_weights(train_loader, device):
-    """
-    Tạo trọng số cho từng lớp để hạn chế ảnh hưởng
-    của việc dataset bị mất cân bằng.
-    """
-
+    """Lớp ít ảnh nhận weight lớn hơn trong CrossEntropyLoss."""
     dataframe = train_loader.dataset.dataframe
-
     class_counts = (
         dataframe["label"]
         .value_counts()
         .sort_index()
         .reindex(range(len(CLASS_NAMES)))
+        .values
+        .astype(np.float32)
     )
 
-    number_of_samples = len(dataframe)
-    number_of_classes = len(CLASS_NAMES)
+    weights = len(dataframe) / (len(CLASS_NAMES) * class_counts)
+    weights_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
 
-    weights = (
-        number_of_samples
-        / (number_of_classes * class_counts.values)
-    )
-
-    weights_tensor = torch.tensor(
-        weights,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    print("Class weights:")
-
-    for class_name, count, weight in zip(
-        CLASS_NAMES,
-        class_counts.values,
-        weights,
-    ):
-        print(
-            f"- {class_name:10s}: "
-            f"{count:4d} ảnh | weight = {weight:.4f}"
-        )
+    print("Class weights của baseline:")
+    for name, count, weight in zip(CLASS_NAMES, class_counts, weights):
+        print(f"- {name:10s}: {int(count):4d} ảnh | weight = {weight:.4f}")
 
     return weights_tensor
 
 
-def train_one_epoch(
-    model,
-    data_loader,
-    criterion,
-    optimizer,
-    device,
-):
+def train_one_epoch(model, data_loader, criterion, optimizer, device):
     model.train()
+
+    # Rất quan trọng: features đã freeze thì BatchNorm cũng phải ở eval mode.
+    model.features.eval()
 
     running_loss = 0.0
     running_correct = 0
     total_samples = 0
 
-    progress_bar = tqdm(
-        data_loader,
-        desc="Training",
-        leave=False,
-    )
+    progress_bar = tqdm(data_loader, desc="Baseline training", leave=False)
 
     for images, labels in progress_bar:
-        images = images.to(
-            device,
-            non_blocking=True,
-        )
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        labels = labels.to(
-            device,
-            non_blocking=True,
-        )
-
-        # Xóa gradient của batch trước
-        optimizer.zero_grad()
-
-        # Dự đoán
+        optimizer.zero_grad(set_to_none=True)
         outputs = model(images)
-
-        # Tính loss
         loss = criterion(outputs, labels)
-
-        # Lan truyền ngược
         loss.backward()
-
-        # Cập nhật trọng số
         optimizer.step()
 
         predictions = outputs.argmax(dim=1)
-
         batch_size = images.size(0)
-
         running_loss += loss.item() * batch_size
-        running_correct += (
-            predictions == labels
-        ).sum().item()
-
+        running_correct += (predictions == labels).sum().item()
         total_samples += batch_size
 
         progress_bar.set_postfix(
             loss=f"{running_loss / total_samples:.4f}",
-            accuracy=(
-                f"{running_correct / total_samples:.4f}"
-            ),
+            accuracy=f"{running_correct / total_samples:.4f}",
         )
 
-    epoch_loss = running_loss / total_samples
-    epoch_accuracy = running_correct / total_samples
-
-    return epoch_loss, epoch_accuracy
+    return running_loss / total_samples, running_correct / total_samples
 
 
-def validate_one_epoch(
-    model,
-    data_loader,
-    criterion,
-    device,
-):
+def validate_one_epoch(model, data_loader, criterion, device):
     model.eval()
-
     running_loss = 0.0
     running_correct = 0
     total_samples = 0
-
-    progress_bar = tqdm(
-        data_loader,
-        desc="Validation",
-        leave=False,
-    )
+    all_labels = []
+    all_predictions = []
 
     with torch.inference_mode():
-        for images, labels in progress_bar:
-            images = images.to(
-                device,
-                non_blocking=True,
-            )
-
-            labels = labels.to(
-                device,
-                non_blocking=True,
-            )
+        for images, labels in data_loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             outputs = model(images)
             loss = criterion(outputs, labels)
-
             predictions = outputs.argmax(dim=1)
 
             batch_size = images.size(0)
-
             running_loss += loss.item() * batch_size
-            running_correct += (
-                predictions == labels
-            ).sum().item()
-
+            running_correct += (predictions == labels).sum().item()
             total_samples += batch_size
+            all_labels.extend(labels.cpu().tolist())
+            all_predictions.extend(predictions.cpu().tolist())
 
-            progress_bar.set_postfix(
-                loss=(
-                    f"{running_loss / total_samples:.4f}"
-                ),
-                accuracy=(
-                    f"{running_correct / total_samples:.4f}"
-                ),
-            )
-
-    epoch_loss = running_loss / total_samples
-    epoch_accuracy = running_correct / total_samples
-
-    return epoch_loss, epoch_accuracy
-
-
-def save_checkpoint(
-    model,
-    epoch,
-    validation_loss,
-    validation_accuracy,
-):
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    macro_f1 = f1_score(
+        all_labels,
+        all_predictions,
+        average="macro",
+        zero_division=0,
     )
 
+    return (
+        running_loss / total_samples,
+        running_correct / total_samples,
+        macro_f1,
+    )
+
+
+def save_checkpoint(model, epoch, validation_loss, validation_accuracy, validation_macro_f1):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint = {
+        "stage": "baseline",
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "validation_loss": validation_loss,
         "validation_accuracy": validation_accuracy,
+        "validation_macro_f1": validation_macro_f1,
         "class_names": CLASS_NAMES,
     }
-
-    torch.save(
-        checkpoint,
-        BEST_MODEL_PATH,
-    )
-
-    print(
-        "Đã lưu model tốt nhất:",
-        BEST_MODEL_PATH,
-    )
+    torch.save(checkpoint, BASELINE_MODEL_PATH)
+    print("Đã lưu baseline tốt nhất:", BASELINE_MODEL_PATH)
 
 
-def train_model(
-    data_dir,
-    epochs=None,
-):
-    """
-    Hàm chính dùng để train MobileNetV3.
-    """
-
-    if epochs is None:
-        epochs = EPOCHS
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
+def train_model(data_dir, epochs: int = BASELINE_EPOCHS):
+    seed_everything(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Thiết bị:", device)
 
-    train_loader, val_loader, test_loader = (
-        create_dataloaders(data_dir)
-    )
+    train_loader, val_loader, test_loader = create_dataloaders(data_dir)
+    model = create_model(freeze_features=True, pretrained=True).to(device)
 
-    model = create_model(
-        freeze_features=True
-    ).to(device)
+    class_weights = calculate_class_weights(train_loader, device)
+    train_criterion = nn.CrossEntropyLoss(weight=class_weights)
+    validation_criterion = nn.CrossEntropyLoss()
 
-    class_weights = calculate_class_weights(
-        train_loader,
-        device,
-    )
-
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights
-    )
-
-    trainable_parameters = filter(
-        lambda parameter: parameter.requires_grad,
-        model.parameters(),
-    )
-
+    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_parameters,
-        lr=LEARNING_RATE,
-        weight_decay=1e-4,
+        lr=BASELINE_LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=2,
     )
 
-    scheduler = (
-        torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.5,
-            patience=2,
-        )
-    )
-
-    best_validation_accuracy = 0.0
+    best_validation_macro_f1 = -1.0
     history = []
 
     for epoch in range(1, epochs + 1):
         start_time = time.time()
-
-        train_loss, train_accuracy = (
-            train_one_epoch(
-                model=model,
-                data_loader=train_loader,
-                criterion=criterion,
-                optimizer=optimizer,
-                device=device,
-            )
+        train_loss, train_accuracy = train_one_epoch(
+            model, train_loader, train_criterion, optimizer, device
         )
-
-        validation_loss, validation_accuracy = (
-            validate_one_epoch(
-                model=model,
-                data_loader=val_loader,
-                criterion=criterion,
-                device=device,
-            )
+        validation_loss, validation_accuracy, validation_macro_f1 = validate_one_epoch(
+            model, val_loader, validation_criterion, device
         )
-
         scheduler.step(validation_loss)
-
-        elapsed_time = time.time() - start_time
-
-        current_learning_rate = (
-            optimizer.param_groups[0]["lr"]
-        )
+        current_lr = optimizer.param_groups[0]["lr"]
 
         history.append(
             {
@@ -315,66 +176,39 @@ def train_model(
                 "train_loss": train_loss,
                 "train_accuracy": train_accuracy,
                 "validation_loss": validation_loss,
-                "validation_accuracy": (
-                    validation_accuracy
-                ),
-                "learning_rate": (
-                    current_learning_rate
-                ),
+                "validation_accuracy": validation_accuracy,
+                "validation_macro_f1": validation_macro_f1,
+                "learning_rate": current_lr,
             }
         )
 
+        print(f"\nEpoch {epoch}/{epochs}")
+        print(f"Train loss: {train_loss:.4f} | Train accuracy: {train_accuracy:.4f}")
         print(
-            f"\nEpoch {epoch}/{epochs}"
+            f"Validation loss: {validation_loss:.4f} | "
+            f"Validation accuracy: {validation_accuracy:.4f} | "
+            f"Macro F1: {validation_macro_f1:.4f}"
         )
+        print(f"Learning rate: {current_lr:.2e}")
+        print(f"Thời gian: {time.time() - start_time:.1f} giây")
 
-        print(
-            f"Train loss: {train_loss:.4f} | "
-            f"Train accuracy: {train_accuracy:.4f}"
-        )
-
-        print(
-            f"Validation loss: "
-            f"{validation_loss:.4f} | "
-            f"Validation accuracy: "
-            f"{validation_accuracy:.4f}"
-        )
-
-        print(
-            f"Learning rate: "
-            f"{current_learning_rate:.2e}"
-        )
-
-        print(
-            f"Thời gian: {elapsed_time:.1f} giây"
-        )
-
-        if (
-            validation_accuracy
-            > best_validation_accuracy
-        ):
-            best_validation_accuracy = (
-                validation_accuracy
-            )
-
+        if validation_macro_f1 > best_validation_macro_f1:
+            best_validation_macro_f1 = validation_macro_f1
             save_checkpoint(
-                model=model,
-                epoch=epoch,
-                validation_loss=validation_loss,
-                validation_accuracy=(
-                    validation_accuracy
-                ),
+                model,
+                epoch,
+                validation_loss,
+                validation_accuracy,
+                validation_macro_f1,
             )
 
-    print("\nTrain hoàn tất.")
+    # Sửa lỗi model cuối epoch khác model tốt nhất.
+    checkpoint = torch.load(BASELINE_MODEL_PATH, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
 
-    print(
-        "Validation accuracy tốt nhất:",
-        f"{best_validation_accuracy:.4f}",
-    )
+    print("\nTrain baseline hoàn tất.")
+    print("Epoch tốt nhất:", checkpoint["epoch"])
+    print("Validation Macro F1 tốt nhất:", f"{checkpoint['validation_macro_f1']:.4f}")
 
-    return (
-        model,
-        history,
-        test_loader,
-    )
+    return model, history, test_loader
